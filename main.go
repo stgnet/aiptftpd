@@ -1,15 +1,14 @@
-// white router recovery (fixed ip tftp handler)
+// arbitrary fixed ip tftp handler
 
 package main
 
 import (
 	"bytes"
 	"encoding/binary"
-	// "encoding/hex"
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"net"
-	"os"
 	"time"
 
 	"github.com/google/gopacket"
@@ -17,6 +16,7 @@ import (
 	"github.com/google/gopacket/pcap"
 )
 
+// return string from zero terminated byte array
 func ztString(bytes []byte) string {
 	for i, b := range bytes {
 		if b == 0 {
@@ -26,6 +26,7 @@ func ztString(bytes []byte) string {
 	return ""
 }
 
+// construct a tftp error response
 func terr(msg string) []byte {
 	fmt.Printf("ERROR: %s\n", msg)
 	var b bytes.Buffer
@@ -36,8 +37,10 @@ func terr(msg string) []byte {
 	return b.Bytes()
 }
 
+// entire file will be loaded into memory here
 var filedata []byte
 
+// open filename and read contents
 func open(filename string) bool {
 	var err error
 	filedata, err = ioutil.ReadFile(filename)
@@ -49,6 +52,7 @@ func open(filename string) bool {
 	return true
 }
 
+// return tftp data packet from file data
 func data(number uint16) []byte {
 	var b bytes.Buffer
 
@@ -77,12 +81,13 @@ func data(number uint16) []byte {
 	return b.Bytes()
 }
 
-func rrq(rq []byte) []byte {
+// return a response to a tftp request for file
+func rrq(rq []byte, file string) []byte {
 	filename := ztString(rq[2:])
 	fmt.Printf("RRQ: %s\n", filename)
-	if len(os.Args) >= 2 {
+	if len(file) != 0 {
 		fmt.Printf("Using instead supplied file %s\n", filename)
-		filename = os.Args[1]
+		filename = file
 	}
 	if !open(filename) {
 		return terr("file not found")
@@ -90,18 +95,20 @@ func rrq(rq []byte) []byte {
 	return data(0)
 }
 
+// handle acknolwedge tftp message, returning next data
 func ack(rq []byte) []byte {
 	return data(binary.BigEndian.Uint16(rq[2:4]))
 }
 
-func tftp(payload []byte) []byte {
+// handle tftp request contained in udp payload packet
+func tftp(payload []byte, file string) []byte {
 	// fmt.Printf("TFTP: %s\n", hex.EncodeToString(payload))
 	if payload[0] != 0 {
 		return terr("bad opcode")
 	}
 	switch payload[1] {
 	case 1: // RRQ
-		return rrq(payload)
+		return rrq(payload, file)
 	case 4: // ACK
 		return ack(payload)
 	default:
@@ -109,6 +116,7 @@ func tftp(payload []byte) []byte {
 	}
 }
 
+// send a raw UDP message from our arbitrary IP address
 func sendUDP(handle *pcap.Handle, iface *net.Interface, dstMAC net.HardwareAddr, srcIP net.IP, dstIP net.IP, srcPort layers.UDPPort, dstPort layers.UDPPort, payload []byte) {
 	if len(payload) == 0 {
 		return
@@ -148,6 +156,7 @@ func sendUDP(handle *pcap.Handle, iface *net.Interface, dstMAC net.HardwareAddr,
 	}
 }
 
+// send a fake ARP response message from our arbitrary IP address
 func sendArp(handle *pcap.Handle, iface *net.Interface, srcIP net.IP, dstMAC net.HardwareAddr, dstIP net.IP) {
 	eth := layers.Ethernet{
 		SrcMAC:       iface.HardwareAddr,
@@ -182,7 +191,8 @@ func sendArp(handle *pcap.Handle, iface *net.Interface, srcIP net.IP, dstMAC net
 	}
 }
 
-func monitor(iface net.Interface) {
+// monitor given interface for packets to the arbitrary IP address
+func monitor(iface net.Interface, ip string, file string) {
 	handle, h_err := pcap.OpenLive(iface.Name, 65536, true, pcap.BlockForever)
 	if h_err != nil {
 		fmt.Printf("Unable to open %s: %v\n", iface.Name, h_err)
@@ -195,7 +205,7 @@ func monitor(iface net.Interface) {
 		return
 	}
 
-	fmt.Printf("Monitoring interface %s\n", iface.Name)
+	fmt.Printf("Monitoring interface %s for %s\n", iface.Name, ip)
 	pkts := gopacket.NewPacketSource(handle, layers.LayerTypeEthernet).Packets()
 	for {
 		var packet gopacket.Packet
@@ -216,19 +226,18 @@ func monitor(iface net.Interface) {
 				srcIP := net.IP(arp.SourceProtAddress).To4()
 				dstIP := net.IP(arp.DstProtAddress).To4()
 				dstMAC := net.HardwareAddr(arp.DstHwAddress)
-				if srcIP.String() != "192.168.1.119" {
+
+				// ignore anything that isn't the desired ip
+				if dstIP.String() != ip {
 					continue
 				}
-				if dstIP.String() != "192.168.1.88" {
-					continue
-				}
-				fmt.Printf("%s: ARP %d %v => %v\n",
+
+				fmt.Printf("%s: ARP %d %v => %v - sending reply\n",
 					iface.Name,
 					arp.Operation,
 					srcIP,
 					dstIP,
 				)
-				fmt.Printf("Sending arp reply\n")
 				sendArp(handle, &iface, dstIP, dstMAC, srcIP)
 				continue
 			}
@@ -245,7 +254,7 @@ func monitor(iface net.Interface) {
 					fmt.Printf("%s: UDP %d => %d with %d bytes\n", iface.Name, udp.SrcPort, udp.DstPort, udp.Length)
 					continue
 				}
-				response := tftp(udp.Payload)
+				response := tftp(udp.Payload, file)
 				sendUDP(handle, &iface, eth.SrcMAC,
 					ip.DstIP, ip.SrcIP,
 					udp.DstPort, udp.SrcPort,
@@ -258,14 +267,20 @@ func monitor(iface net.Interface) {
 	}
 }
 
+// go through the interfaces avaialble and monitor each one
 func main() {
+	ip := flag.String("ip", "192.168.1.88", "IP Address of TFTP server")
+	file := flag.String("file", "", "Filename to override")
+	wait := flag.Int("wait", 300, "Time to wait in seconds for completed transfer")
+	flag.Parse()
+
 	ifaces, ifErr := net.Interfaces()
 	if ifErr != nil {
 		panic(ifErr)
 	}
 	for _, iface := range ifaces {
-		go monitor(iface)
+		go monitor(iface, *ip, *file)
 	}
 
-	time.Sleep(300 * time.Second)
+	time.Sleep(time.Duration(*wait) * time.Second)
 }
